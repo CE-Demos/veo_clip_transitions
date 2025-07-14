@@ -6,12 +6,12 @@ import time
 import base64
 import requests
 import cv2
+import math
 
 from moviepy.editor import VideoFileClip, concatenate_videoclips, vfx
 from google.cloud import storage
 from google.auth.transport.requests import Request
 from google.auth import default as google_auth_default
-from google.cloud import storage
 
 # --- Configuration ---
 PROJECT_ID = "veo-testing" 
@@ -21,7 +21,7 @@ SOURCE_PREFIX = "CRED_exps/input_videos"  # Path to the folder of input videos y
 DESTINATION_PREFIX = "CRED_exps/output_videos/"
 FINAL_VIDEO_NAME = "final_video_with_interpolated_transitions.mp4"
 TRANSITION_DURATION = 1.0  # Duration of the transition in seconds
-TRANSITION_SPEED = 5.0     # e.g., 2.0 means the transition plays at 2x speed
+TRANSITION_SPEED = 2.0     # e.g., 2.0 means the transition plays at 2x speed
 INTERPOLATION_PROMPT = "Smoothly transition from the first slate to the last slate without making the characters move too much"
 
 
@@ -34,7 +34,72 @@ def get_auth_headers() -> dict:
     return {"Authorization": f"Bearer {credentials.token}", "Content-Type": "application/json"}
 
 
-# --- Placeholder for AI Frame Interpolation ---
+def remove_every_nth_frame(input_video_path, output_video_path, n=2):
+    """
+    Removes every nth frame from a video and saves the result.
+
+    Args:
+        input_video_path (str): Path to the source video file.
+        output_video_path (str): Path to save the output video file.
+        n (int): The interval for frame removal (e.g., n=5 removes every 5th frame).
+    """
+    if not os.path.exists(input_video_path):
+        print(f"Error: Input video not found at {input_video_path}")
+        return
+
+    print("Loading video...")
+    original_clip = VideoFileClip(input_video_path)
+    
+    # Get video properties
+    fps = original_clip.fps
+    duration = original_clip.duration
+    
+    # Intuitively calculate the total number of frames
+    total_frames = math.ceil(duration * fps)
+    print(f"Video loaded. FPS: {fps}, Total Frames: ~{total_frames}")
+
+    # Generate the list of frame numbers to remove
+    # We start from n-1 because frames are 0-indexed (e.g., the 5th frame is at index 4)
+    frames_to_remove = list(range(n - 1, total_frames, n))
+    print(f"Generated list to remove every {n}th frame. Total frames to remove: {len(frames_to_remove)}")
+    
+    frame_duration = 1 / fps
+    subclips = []
+    last_cut_time = 0.0
+
+    # Create subclips from the parts of the video to keep
+    for frame_number in frames_to_remove:
+        cut_time = frame_number / fps
+        
+        if cut_time > last_cut_time:
+            subclip = original_clip.subclip(last_cut_time, cut_time)
+            subclips.append(subclip)
+        
+        last_cut_time = cut_time + frame_duration
+
+    # Add the final segment of the video
+    if last_cut_time < duration:
+        subclip = original_clip.subclip(last_cut_time, duration)
+        subclips.append(subclip)
+        
+    if not subclips:
+        print("Warning: The frame removal process resulted in an empty video.")
+        original_clip.close()
+        return
+
+    print("Concatenating remaining clips...")
+    final_clip = concatenate_videoclips(subclips)
+    
+    print(f"Writing output video to {output_video_path}...")
+    final_clip.write_videofile(output_video_path, codec="libx264", audio_codec="aac")
+    
+    # Clean up resources
+    original_clip.close()
+    final_clip.close()
+    
+    print("✅ Process complete.")
+
+# --- AI Frame Interpolation ---
 def interpolate_video_veo2(
     start_image_path: str,
     end_image_path: str,
@@ -247,7 +312,23 @@ def process_gcs_videos():
                 print("  WARNING: Failed to download transition video. Skipping.")
                 continue
 
-            transition_clip = VideoFileClip(local_transition_path)
+            local_transition_frame_eliminated_path = os.path.join(local_temp_dir, f"transition_{i}_frame_elm.mp4")
+
+            local_transition_frame_eliminated_final_path = os.path.join(local_temp_dir, f"transition_{i}_frame_elm_final.mp4")
+
+            remove_every_nth_frame(local_transition_path, local_transition_frame_eliminated_path, n=2)
+
+            if not os.path.exists(local_transition_frame_eliminated_path):
+                print("  WARNING: Failed to download transition video. Skipping.")
+                continue
+
+            remove_every_nth_frame(local_transition_frame_eliminated_path, local_transition_frame_eliminated_final_path, n=2)
+
+            if not os.path.exists(local_transition_frame_eliminated_final_path):
+                print("  WARNING: Failed to download transition video. Skipping.")
+                continue
+
+            transition_clip = VideoFileClip(local_transition_frame_eliminated_final_path)
 
             # Alter the speed of the transition
             sped_up_transition = transition_clip.fx(vfx.speedx, TRANSITION_SPEED)
